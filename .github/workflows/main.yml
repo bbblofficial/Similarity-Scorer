@@ -1,10 +1,9 @@
 # ============================================================
-# Similarity Scorer — All-in-one GitHub Actions host (FIXED)
+# Similarity Scorer — All-in-one GitHub Actions host
 # بک‌اند FastAPI + پنل وب + Cloudflare Quick Tunnel
-# تغییرات نسبت به نسخه قبل:
-#   - load_models() در startup اجرا میشه (باگ ready:false رفع شد)
-#   - /health با بررسی واقعی مدل‌ها جواب میده
-#   - readiness loop مقاوم‌تر (تشخیص مرگ پروسه + timeout بیشتر)
+# نمره‌دهی سختگیرانه فقط بر اساس سیگنال‌های مدل:
+#   final = (entailment^1.5) * similarity - 0.5 * contradiction
+# بدون heuristic داخلی (نه طول، نه کلمات کلیدی، نه آستانه دستی)
 # ============================================================
 
 name: Host Similarity Scorer
@@ -70,7 +69,6 @@ jobs:
 
           @asynccontextmanager
           async def lifespan(app):
-              # مدل‌ها موقع بالا اومدن سرور لود میشن
               load_models()
               yield
 
@@ -112,7 +110,7 @@ jobs:
           <body>
           <div class="card">
           <h1>نمره‌دهی جواب تشریحی</h1>
-          <div class="subtitle">مقایسه معنایی جواب کاربر با جواب مرجع</div>
+          <div class="subtitle">مقایسه معنایی جواب کاربر با جواب مرجع — سختگیرانه</div>
           <div class="field">
           <label>جواب مرجع (کلید)</label>
           <textarea id="ref" placeholder="جواب صحیح را وارد کنید..."></textarea>
@@ -188,6 +186,8 @@ jobs:
               if embedder is None or nli_model is None:
                   return {"score": 0.0, "sim": 0.0, "entailment": None,
                           "contradiction": None, "reason": "models_not_ready"}
+
+              # مرحله 1: شباهت برداری
               ref_emb, usr_emb = embedder.encode(
                   [f"query: {req.reference}", f"passage: {req.user_answer}"],
                   normalize_embeddings=True,
@@ -195,13 +195,18 @@ jobs:
               sim = float(util.cos_sim(ref_emb, usr_emb).item())
               result = {"sim": round(sim, 3), "entailment": None,
                         "contradiction": None, "score": 0.0, "reason": "ok"}
+
+              # اگه شباهت خیلی پایینه، NLI هم بی‌فایده‌ست
               if sim < 0.4:
                   result["reason"] = "too_different"
                   return result
+
+              # مرحله 2: NLI (entailment / neutral / contradiction)
               inp = nli_tok(req.reference, req.user_answer,
                             truncation=True, max_length=512, return_tensors="pt")
               with torch.no_grad():
                   probs = torch.softmax(nli_model(**inp).logits, dim=-1)[0].tolist()
+
               entail = 0.0
               contra = 0.0
               for i, name in NLI_LABELS.items():
@@ -209,7 +214,14 @@ jobs:
                       entail = probs[i]
                   elif "contra" in name:
                       contra = probs[i]
-              final = max(0.0, min(1.0, entail - 0.5 * contra))
+
+              # مرحله 3: فرمول سختگیرانه فقط با سیگنال‌های مدل
+              #   - entailment با توان 1.5 → تطابق پایین نامتناسب‌تر جریمه میشه
+              #   - ضرب در similarity → هر دو سیگنال باید بالا باشن
+              #   - منهای 0.5 × contradiction → تناقض جریمه میشه
+              final = (entail ** 1.5) * sim - 0.5 * contra
+              final = max(0.0, min(1.0, final))
+
               result.update({
                   "entailment": round(entail, 3),
                   "contradiction": round(contra, 3),
