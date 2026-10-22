@@ -1,9 +1,8 @@
 # ============================================================
 # Similarity Scorer — All-in-one GitHub Actions host
-# بک‌اند FastAPI + پنل وب + Cloudflare Quick Tunnel
-# نمره‌دهی سختگیرانه فقط بر اساس سیگنال‌های مدل:
-#   final = (entailment^1.5) * similarity - 0.5 * contradiction
-# بدون heuristic داخلی (نه طول، نه کلمات کلیدی، نه آستانه دستی)
+# - بار اول: دانلود پکیج‌ها + مدل‌ها و آپلود به GitHub Release
+# - بارهای بعد: استفاده از cache و Release (بدون دانلود مجدد)
+# - فرمول کالیبره‌شده: 0.4*sim + 0.6*entail - 0.7*contra
 # ============================================================
 
 name: Host Similarity Scorer
@@ -13,23 +12,32 @@ on:
   push:
     branches: [main]
 
+permissions:
+  contents: write
+
 jobs:
   host:
     runs-on: ubuntu-latest
     timeout-minutes: 355
 
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: Cache HuggingFace models
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-v1-fastapi-uvicorn-sentence-transformers-transformers-torch-pydantic
+
+      - name: Cache HF models (fast path)
+        id: cache_hf
         uses: actions/cache@v4
         with:
           path: ~/.cache/huggingface
-          key: hf-e5small-mnli-v3
+          key: hf-v1-e5small-mdeberta
 
       - name: Install dependencies
         run: |
@@ -47,7 +55,6 @@ jobs:
           from sentence_transformers import SentenceTransformer, util
           from transformers import AutoTokenizer, AutoModelForSequenceClassification
 
-          # --- Globals ---
           embedder = None
           nli_tok = None
           nli_model = None
@@ -110,7 +117,7 @@ jobs:
           <body>
           <div class="card">
           <h1>نمره‌دهی جواب تشریحی</h1>
-          <div class="subtitle">مقایسه معنایی جواب کاربر با جواب مرجع — سختگیرانه</div>
+          <div class="subtitle">مقایسه معنایی جواب کاربر با جواب مرجع</div>
           <div class="field">
           <label>جواب مرجع (کلید)</label>
           <textarea id="ref" placeholder="جواب صحیح را وارد کنید..."></textarea>
@@ -196,12 +203,11 @@ jobs:
               result = {"sim": round(sim, 3), "entailment": None,
                         "contradiction": None, "score": 0.0, "reason": "ok"}
 
-              # اگه شباهت خیلی پایینه، NLI هم بی‌فایده‌ست
               if sim < 0.4:
                   result["reason"] = "too_different"
                   return result
 
-              # مرحله 2: NLI (entailment / neutral / contradiction)
+              # مرحله 2: NLI
               inp = nli_tok(req.reference, req.user_answer,
                             truncation=True, max_length=512, return_tensors="pt")
               with torch.no_grad():
@@ -215,11 +221,11 @@ jobs:
                   elif "contra" in name:
                       contra = probs[i]
 
-              # مرحله 3: فرمول سختگیرانه فقط با سیگنال‌های مدل
-              #   - entailment با توان 1.5 → تطابق پایین نامتناسب‌تر جریمه میشه
-              #   - ضرب در similarity → هر دو سیگنال باید بالا باشن
-              #   - منهای 0.5 × contradiction → تناقض جریمه میشه
-              final = (entail ** 1.5) * sim - 0.5 * contra
+              # مرحله 3: نمره نهایی — میانگین وزن‌دار کالیبره‌شده
+              # برای متن یکسان: 0.4*1.0 + 0.6*0.99 - 0.7*0.0 ≈ 1.0 ✅
+              # برای جواب ناقص: 0.4*0.89 + 0.6*0.92 - 0.7*0.0 ≈ 0.91
+              # برای تناقض: 0.4*0.85 + 0.6*0.1 - 0.7*0.8 ≈ 0.0 (جریمه شدید)
+              final = 0.4 * sim + 0.6 * entail - 0.7 * contra
               final = max(0.0, min(1.0, final))
 
               result.update({
@@ -231,12 +237,48 @@ jobs:
           PYEOF
           python -c "compile(open('app.py').read(), 'app.py', 'exec')" && echo "app.py syntax OK ($(wc -l < app.py) lines)"
 
-      - name: Pre-download models
+      - name: Ensure models available (release fallback)
+        if: steps.cache_hf.outputs.cache-hit != 'true'
         env:
-          PYTHONUNBUFFERED: '1'
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('intfloat/multilingual-e5-small'); print('embedder cached')"
-          python -c "from transformers import AutoTokenizer, AutoModelForSequenceClassification; n='MoritzLaurer/mDeBERTa-v3-base-mnli-xnli'; AutoTokenizer.from_pretrained(n); AutoModelForSequenceClassification.from_pretrained(n); print('NLI cached')"
+          set +e
+          RESTORED=false
+          mkdir -p ~/.cache/huggingface
+
+          echo "HF cache miss. Trying GitHub Release..."
+          if gh release download model-cache --repo "${{ github.repository }}" \
+               --pattern 'hf-cache.tar.gz' \
+               --output /tmp/hf-cache.tar.gz --clobber 2>/dev/null; then
+            echo "Extracting models from release..."
+            tar -xzf /tmp/hf-cache.tar.gz -C ~/.cache/
+            rm -f /tmp/hf-cache.tar.gz
+            RESTORED=true
+            echo "Models restored from release."
+          fi
+
+          if [ "$RESTORED" = "false" ]; then
+            echo "No release found. Downloading models from HuggingFace..."
+            python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('intfloat/multilingual-e5-small'); print('embedder cached')"
+            python -c "from transformers import AutoTokenizer, AutoModelForSequenceClassification; n='MoritzLaurer/mDeBERTa-v3-base-mnli-xnli'; AutoTokenizer.from_pretrained(n); AutoModelForSequenceClassification.from_pretrained(n); print('NLI cached')"
+
+            echo "Packaging models for future runs..."
+            tar -czf /tmp/hf-cache.tar.gz -C ~/.cache huggingface
+            ls -lh /tmp/hf-cache.tar.gz
+
+            if gh release view model-cache --repo "${{ github.repository }}" >/dev/null 2>&1; then
+              echo "Updating existing release..."
+              gh release upload model-cache --repo "${{ github.repository }}" \
+                /tmp/hf-cache.tar.gz --clobber
+            else
+              echo "Creating new release..."
+              gh release create model-cache --repo "${{ github.repository }}" \
+                --title "Model Cache" \
+                --notes "Cached HuggingFace models for Similarity Scorer. Delete this release to force re-download on next run." \
+                /tmp/hf-cache.tar.gz
+            fi
+            echo "Models uploaded to release. Future runs will reuse this."
+          fi
 
       - name: Download cloudflared
         run: |
@@ -302,7 +344,7 @@ jobs:
             echo ""
             echo "### $URL"
             echo ""
-            echo "_Ephemeral URL — dies when this workflow ends (max ~6h). Re-run the workflow to get a new one._"
+            echo "_Ephemeral URL — dies when this workflow ends (max ~6h). Re-run to get a new one._"
           } >> "$GITHUB_STEP_SUMMARY"
 
           echo "Keeping workflow alive..."
