@@ -1,8 +1,10 @@
 # ============================================================
-# Similarity Scorer — All-in-one GitHub Actions host
-# بک‌اند FastAPI + پنل وب (HTML/CSS/JS) + Cloudflare Quick Tunnel
-# همه چیز در همین یک فایل. کافیه push کنی یا manually run بزنی.
-# لینک زنده در logs و step summary چاپ میشه (موقتی ~۶ ساعت).
+# Similarity Scorer — All-in-one GitHub Actions host (FIXED)
+# بک‌اند FastAPI + پنل وب + Cloudflare Quick Tunnel
+# تغییرات نسبت به نسخه قبل:
+#   - load_models() در startup اجرا میشه (باگ ready:false رفع شد)
+#   - /health با بررسی واقعی مدل‌ها جواب میده
+#   - readiness loop مقاوم‌تر (تشخیص مرگ پروسه + timeout بیشتر)
 # ============================================================
 
 name: Host Similarity Scorer
@@ -39,13 +41,14 @@ jobs:
         run: |
           cat > app.py << 'PYEOF'
           import torch
+          from contextlib import asynccontextmanager
           from fastapi import FastAPI
           from fastapi.responses import HTMLResponse
           from pydantic import BaseModel
           from sentence_transformers import SentenceTransformer, util
           from transformers import AutoTokenizer, AutoModelForSequenceClassification
 
-          app = FastAPI(title="Similarity Scorer")
+          # --- Globals ---
           embedder = None
           nli_tok = None
           nli_model = None
@@ -53,17 +56,25 @@ jobs:
 
           def load_models():
               global embedder, nli_tok, nli_model, NLI_LABELS
-              if embedder is not None:
+              if embedder is not None and nli_model is not None:
                   return
-              print("Loading embedder...", flush=True)
+              print("Loading embedder (multilingual-e5-small)...", flush=True)
               embedder = SentenceTransformer("intfloat/multilingual-e5-small")
-              print("Loading NLI...", flush=True)
+              print("Loading NLI (mDeBERTa-v3-base-mnli-xnli)...", flush=True)
               nli_name = "MoritzLaurer/mDeBERTa-v3-base-mnli-xnli"
               nli_tok = AutoTokenizer.from_pretrained(nli_name)
               nli_model = AutoModelForSequenceClassification.from_pretrained(nli_name)
               nli_model.eval()
               NLI_LABELS = {i: l.lower() for i, l in nli_model.config.id2label.items()}
               print("Models ready.", flush=True)
+
+          @asynccontextmanager
+          async def lifespan(app):
+              # مدل‌ها موقع بالا اومدن سرور لود میشن
+              load_models()
+              yield
+
+          app = FastAPI(title="Similarity Scorer", lifespan=lifespan)
 
           HTML_PAGE = """<!DOCTYPE html>
           <html lang="fa" dir="rtl">
@@ -169,22 +180,26 @@ jobs:
 
           @app.get("/health")
           def health():
-              return {"status": "ok", "ready": embedder is not None}
+              ready = embedder is not None and nli_model is not None
+              return {"status": "ok", "ready": ready}
 
           @app.post("/score")
           def score(req: ScoreReq):
-              if embedder is None:
-                  load_models()
+              if embedder is None or nli_model is None:
+                  return {"score": 0.0, "sim": 0.0, "entailment": None,
+                          "contradiction": None, "reason": "models_not_ready"}
               ref_emb, usr_emb = embedder.encode(
                   [f"query: {req.reference}", f"passage: {req.user_answer}"],
                   normalize_embeddings=True,
               )
               sim = float(util.cos_sim(ref_emb, usr_emb).item())
-              result = {"sim": round(sim, 3), "entailment": None, "contradiction": None, "score": 0.0, "reason": "ok"}
+              result = {"sim": round(sim, 3), "entailment": None,
+                        "contradiction": None, "score": 0.0, "reason": "ok"}
               if sim < 0.4:
                   result["reason"] = "too_different"
                   return result
-              inp = nli_tok(req.reference, req.user_answer, truncation=True, max_length=512, return_tensors="pt")
+              inp = nli_tok(req.reference, req.user_answer,
+                            truncation=True, max_length=512, return_tensors="pt")
               with torch.no_grad():
                   probs = torch.softmax(nli_model(**inp).logits, dim=-1)[0].tolist()
               entail = 0.0
@@ -225,10 +240,16 @@ jobs:
 
           python -m uvicorn app:app --host 0.0.0.0 --port 8000 > server.log 2>&1 &
           SERVER_PID=$!
+          echo "Server PID: $SERVER_PID"
 
           echo "Waiting for server to load models..."
           READY=0
-          for i in $(seq 1 60); do
+          for i in $(seq 1 90); do
+            if ! kill -0 $SERVER_PID 2>/dev/null; then
+              echo "::error::Server process died during startup"
+              cat server.log
+              exit 1
+            fi
             if curl -s http://localhost:8000/health | grep -q '"ready":true'; then
               echo "Server ready after $((i*10))s"
               READY=1
